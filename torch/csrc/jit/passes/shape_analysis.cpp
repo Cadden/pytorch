@@ -8,6 +8,10 @@
 
 namespace torch { namespace jit {
 
+struct propagation_error : std::exception {};
+
+#define SHAPE_ASSERT(cond) if (!(cond)) throw propagation_error()
+
 namespace {
 void setDynamicType(Node * node) {
   for(auto o : node->outputs()) {
@@ -127,7 +131,7 @@ void PropagateShapeOnNode(Node * node) {
         auto tp = types.at(0);
         auto sizes = tp->sizes();
         int64_t dim = node->i(kdim);
-        JIT_ASSERT(dim >= 0 && static_cast<size_t>(dim) < sizes.size());
+        SHAPE_ASSERT(dim >= 0 && static_cast<size_t>(dim) < sizes.size());
         if (node->i(kkeepdim)) {
           sizes[dim] = 1;
         } else {
@@ -143,7 +147,7 @@ void PropagateShapeOnNode(Node * node) {
       auto sizes = tp->sizes();
       auto strides = tp->strides();
       int64_t dim = node->i(kdim);
-      JIT_ASSERT(dim >= 0 && static_cast<size_t>(dim) < sizes.size());
+      SHAPE_ASSERT(dim >= 0 && static_cast<size_t>(dim) < sizes.size());
       if (sizes[dim] == 1) {
         sizes.erase(sizes.begin() + dim);
         strides.erase(strides.begin() + dim);
@@ -155,21 +159,20 @@ void PropagateShapeOnNode(Node * node) {
       auto sizes = tp->sizes();
       auto strides = tp->strides();
       int64_t dim = node->i(kdim);
-      JIT_ASSERT(dim >= 0 && static_cast<size_t>(dim) <= sizes.size());
+      SHAPE_ASSERT(dim >= 0 && static_cast<size_t>(dim) <= sizes.size());
       sizes.insert(sizes.begin() + dim, 1);
       strides.insert(strides.begin() + dim, 1);
       node->output()->setType(tp->withSizesStrides(sizes, strides));
     } break;
     case kview: {
-      JIT_ASSERT(types.size() == 1);
+      SHAPE_ASSERT(types.size() == 1);
       auto sizes = node->is(ksize);
       bool inferred = false;
       size_t inferred_idx;
       int64_t size_product = 1;
       for (size_t i=0; i<sizes.size(); ++i) {
         if (sizes[i] == -1) {
-          if (inferred)
-            throw std::runtime_error("-1 occured in more than 1 size position");
+          if (inferred) throw propagation_error();
           inferred = true;
           inferred_idx = i;
         } else {
@@ -179,7 +182,7 @@ void PropagateShapeOnNode(Node * node) {
 
       if (inferred) {
         auto rep_ten = representativeTensor(types[0]);
-        JIT_ASSERT(size_product != 0);
+        SHAPE_ASSERT(size_product != 0);
         int64_t inferred_size = rep_ten.numel() / size_product;
         sizes[inferred_idx] = inferred_size;
       }
@@ -222,6 +225,9 @@ void PropagateShapeOnNode(Node * node) {
         setDynamicType(node);
         break;
       }
+      // XXX: we're not catching any exceptions from the op for now. This
+      // is to uncover any mistakes we could make when editing this code,
+      // but eventually we should start raising propagation_errors.
       op_info.op(stack);
       JIT_ASSERT(stack.size() == node->outputs().size());
       for(size_t i = 0; i < stack.size(); ++i) {
@@ -236,6 +242,8 @@ void PropagateShapeOnBlock(Block * block) {
   for (Node * node : block->nodes()) {
     try {
       PropagateShapeOnNode(node);
+    } catch(propagation_error& e) {
+      setDynamicType(node);
     } catch(std::exception & e) {
       if(auto sl = node->getSourceLocation()) {
         sl->wrapAndRethrowException(e, "operation failed shape propagation");
